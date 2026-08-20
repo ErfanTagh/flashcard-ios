@@ -117,6 +117,27 @@ actor APIClient {
         ])
     }
 
+    // MARK: - Importing
+
+    /// Creates a deck from a JSON document.
+    ///
+    /// Takes the raw bytes rather than a parsed object, so untyped JSON never
+    /// has to cross into this actor as `Any`. Parsing happens here, and a
+    /// malformed document is reported before any request is made.
+    func importDeck(email: String, jsonData: Data, name: String?) async throws -> DeckImportResponse {
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: jsonData, options: [.fragmentsAllowed])
+        } catch {
+            throw APIError.server(status: 400,
+                                  message: "That isn't valid JSON. Check for a missing comma or bracket.")
+        }
+
+        var body: [String: Any] = ["token": email, "deck": parsed]
+        if let name, !name.isEmpty { body["name"] = name }
+        return try await sendReturning("/api/collections/import", method: "POST", body: body)
+    }
+
     // MARK: - Images
 
     /// Uploads a picture and returns the id a card refers to it by.
@@ -347,6 +368,24 @@ private struct ImageUploadResponse: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case imageID = "image_id"
+    }
+}
+
+struct DeckImportResponse: Decodable {
+    var collection: String
+    var imported: Int
+    /// Non-fatal notes, such as a term that appeared twice.
+    var warnings: [String] = []
+
+    enum CodingKeys: String, CodingKey {
+        case collection, imported, warnings
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        collection = try c.decode(String.self, forKey: .collection)
+        imported = try c.decode(Int.self, forKey: .imported)
+        warnings = try c.decodeIfPresent([String].self, forKey: .warnings) ?? []
     }
 }
 

@@ -11,6 +11,7 @@ struct CollectionsView: View {
     @Environment(LibraryStore.self) private var store
 
     @State private var editorMode: CollectionEditor.Mode?
+    @State private var showingImport = false
     @State private var deleteTarget: String?
 
     var body: some View {
@@ -36,7 +37,17 @@ struct CollectionsView: View {
                     ToolbarItem(placement: .topBarLeading) {
                         BrandMark()
                     }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            showingImport = true
+                        } label: {
+                            Label("Import a deck", systemImage: "square.and.arrow.down")
+                        }
+                    }
                 }
+            }
+            .sheet(isPresented: $showingImport) {
+                ImportDeckView()
             }
             .primaryAction("New Collection") { editorMode = .create }
             .sheet(item: $editorMode) { mode in

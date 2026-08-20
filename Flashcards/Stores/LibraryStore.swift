@@ -272,6 +272,51 @@ final class LibraryStore {
         return done
     }
 
+    // MARK: - Importing
+
+    /// Creates a deck from pasted JSON. Returns nil on failure, having already
+    /// recorded why in `errorMessage`.
+    func importDeck(json: String, name: String) async -> DeckImportResponse? {
+        guard let client = resolveClient(), let email = auth.email else { return nil }
+
+        let cleaned = Self.strippingCodeFences(json)
+        guard !cleaned.isEmpty, let data = cleaned.data(using: .utf8) else {
+            errorMessage = "There's nothing to import."
+            return nil
+        }
+
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let response = try await client.importDeck(email: email, jsonData: data,
+                                                       name: trimmedName)
+            await refreshAll()
+            return response
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
+    /// Removes the ```json fence a model wraps its answer in despite being told
+    /// not to. Cheaper than asking the reader to tidy it by hand.
+    static func strippingCodeFences(_ text: String) -> String {
+        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("```") else { return trimmed }
+
+        // Drop the opening fence along with any language tag on the same line.
+        if let firstNewline = trimmed.firstIndex(of: "\n") {
+            trimmed = String(trimmed[trimmed.index(after: firstNewline)...])
+        } else {
+            trimmed = String(trimmed.dropFirst(3))
+        }
+        if let closing = trimmed.range(of: "```", options: .backwards) {
+            trimmed = String(trimmed[..<closing.lowerBound])
+        }
+        return trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - Plumbing
 
     /// Runs a write, surfaces any failure, and refetches on success.

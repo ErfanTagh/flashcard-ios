@@ -199,6 +199,23 @@ Inside a collection:
   only as a fallback when the server can't be reached, or is older than this
   endpoint. Grading offline beats not grading at all.
 
+### Importing a deck from JSON
+
+The Collections tab can build a deck from a JSON document, which is mostly a
+way to have an AI write one. `POST /api/collections/import` does the work and
+is deliberately forgiving about shape — `front`/`back` and `question`/`answer`
+are accepted alongside `term`/`definition`, as is a bare list with no wrapper —
+because the point is that whatever a model returned should work.
+
+The screen shows the prompt rather than only offering to copy it: the prompt is
+the only thing that explains what `TOPIC` means, and the card count is in there
+to change before sending. JSON arrives by paste, by file, or typed. A ```` ```json ````
+fence is stripped on the way in, since a model adds one occasionally however
+firmly it was asked not to.
+
+The prompt is word for word the one the web client shows, so a deck built on
+one and pasted into the other behaves identically.
+
 ### Pictures on cards
 
 A card's answer can be text, a picture, or both. Pictures are stored in
