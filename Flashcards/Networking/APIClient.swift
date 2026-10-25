@@ -29,17 +29,16 @@ enum APIError: LocalizedError {
 ///
 /// Two quirks of that API shape everything below:
 ///
-/// 1. A user is identified by their email address, sent as `token` in bodies
-///    and as `email`/path component in GETs. There is no per-request bearer
-///    token on the card endpoints.
+/// 1. The caller is whoever the bearer token says. The email still travels in
+///    bodies as `token` and in GETs as `email` or a path component, but the
+///    API ignores it now: it reads the address out of the verified token. The
+///    arguments below are kept because they are still part of the URL shape.
 /// 2. Failures usually arrive as HTTP 200 with `{"status": 4xx, "error": ...}`
 ///    in the body, so the status code alone never tells you whether a write
 ///    succeeded. `send` checks both.
 ///
-/// The Auth0 access token is still attached as a bearer header on every call.
-/// The card endpoints ignore it today — only `/api/token` is behind
-/// `@requires_auth` — but sending it means putting real auth on the backend
-/// needs no client change.
+/// Attaching the access token on every call is what made the backend's move to
+/// real authentication need no change here.
 actor APIClient {
     private let session: URLSession
     private let baseURL: URL
