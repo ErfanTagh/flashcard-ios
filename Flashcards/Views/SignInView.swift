@@ -1,12 +1,30 @@
 import SwiftUI
 
-/// Auth0 Universal Login, the same tenant and flow the web client uses. The
-/// server address sits here too, because on a phone there is no Vite proxy to
-/// make `/api/...` resolve.
+/// Sign in or create an account — the same RecallCards account as the
+/// website. The server address sits here too, because on a phone there is no
+/// Vite proxy to make `/api/...` resolve.
 struct SignInView: View {
     @Environment(ServerSettings.self) private var settings
     @Environment(AuthService.self) private var auth
     @Environment(LibraryStore.self) private var store
+
+    private enum Mode: String, CaseIterable, Identifiable {
+        case signIn = "Sign in"
+        case signUp = "Create account"
+        var id: Self { self }
+    }
+
+    private enum Field: Hashable { case name, email, password, confirm }
+
+    @State private var mode = Mode.signIn
+    @State private var name = ""
+    @State private var email = ""
+    @State private var password = ""
+    @State private var confirm = ""
+    @State private var errorText: String?
+    @State private var infoText: String?
+    @State private var awaitingVerification = false
+    @FocusState private var focus: Field?
 
     @State private var serverAddress = ""
     @State private var validationMessage: String?
@@ -14,43 +32,14 @@ struct SignInView: View {
     @State private var showingDeveloperSignIn = false
     @State private var developerEmail = ""
 
+    private static let passwordMinimum = 8
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 28) {
                     header
-
-                    VStack(spacing: 14) {
-                        Button(action: logIn) {
-                            HStack(spacing: 8) {
-                                if auth.isAuthenticating {
-                                    ProgressView().controlSize(.small).tint(.white)
-                                } else {
-                                    Image(systemName: "lock.shield")
-                                }
-                                Text(auth.isAuthenticating ? "Opening Auth0…" : "Log in")
-                                    .font(.headline)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(auth.isAuthenticating)
-
-                        Text("Opens Auth0 in a secure browser sheet. Sign up there if you don't have an account yet — it's the same login as the website.")
-                            .font(.footnote)
-                            .foregroundStyle(Theme.mutedForeground)
-                            .multilineTextAlignment(.center)
-                    }
-
-                    if !auth.isConfigured {
-                        Label("Auth0 isn't configured — set Auth0Domain and Auth0ClientID in Info.plist.",
-                              systemImage: "exclamationmark.triangle.fill")
-                            .font(.footnote)
-                            .foregroundStyle(Theme.accent)
-                            .multilineTextAlignment(.leading)
-                    }
-
+                    accountForm
                     serverSection
 
                     if let validationMessage {
@@ -69,18 +58,197 @@ struct SignInView: View {
                 }
                 .padding(24)
             }
+            .scrollDismissesKeyboard(.interactively)
             .background(Theme.background)
             .navigationTitle("Recall Cards")
             .navigationBarTitleDisplayMode(.inline)
         }
         .onAppear { serverAddress = settings.baseURLString }
+        .onChange(of: mode) {
+            errorText = nil
+            infoText = nil
+            awaitingVerification = false
+        }
         .alert("Developer sign-in", isPresented: $showingDeveloperSignIn) {
             TextField("email", text: $developerEmail)
                 .textInputAutocapitalization(.never)
             Button("Continue") { developerSignIn() }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Skips Auth0 and identifies you by email only, like the web client's VITE_BYPASS_AUTH mode. For local development.")
+            Text("Identifies you by email only, like the web client's VITE_BYPASS_AUTH mode. Works only against a local backend started with RECALLCARDS_DEV_AUTH.")
+        }
+    }
+
+    // MARK: - Account form
+
+    private var accountForm: some View {
+        VStack(spacing: 14) {
+            Picker("Mode", selection: $mode) {
+                ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+
+            if mode == .signUp {
+                inputField("Name (optional)", text: $name, field: .name)
+                    .textContentType(.givenName)
+            }
+
+            inputField("Email", text: $email, field: .email)
+                .textContentType(.emailAddress)
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            secureField(mode == .signUp ? "Password (at least \(Self.passwordMinimum) characters)" : "Password",
+                        text: $password, field: .password)
+                .textContentType(mode == .signUp ? .newPassword : .password)
+
+            if mode == .signUp {
+                secureField("Confirm password", text: $confirm, field: .confirm)
+                    .textContentType(.newPassword)
+            }
+
+            if let errorText {
+                Label(errorText, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(Theme.destructive)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let infoText {
+                Label(infoText, systemImage: "envelope.badge")
+                    .font(.callout)
+                    .foregroundStyle(Theme.foreground)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Button(action: submit) {
+                HStack(spacing: 8) {
+                    if auth.isAuthenticating {
+                        ProgressView().controlSize(.small).tint(.white)
+                    }
+                    Text(mode == .signIn ? "Sign in" : "Create account")
+                        .font(.headline)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(auth.isAuthenticating)
+
+            HStack {
+                if mode == .signIn {
+                    Button("Forgot password?", action: forgotPassword)
+                }
+                Spacer()
+                if awaitingVerification {
+                    Button("Resend link", action: resendLink)
+                }
+            }
+            .font(.footnote)
+
+            Text(mode == .signIn
+                 ? "The same account as recallcards.net."
+                 : "We'll email you a link to activate your account. Open it, then sign in here.")
+                .font(.footnote)
+                .foregroundStyle(Theme.mutedForeground)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    private func inputField(_ title: String, text: Binding<String>, field: Field) -> some View {
+        TextField(title, text: text)
+            .focused($focus, equals: field)
+            .submitLabel(.next)
+            .padding(12)
+            .background(Theme.muted, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func secureField(_ title: String, text: Binding<String>, field: Field) -> some View {
+        SecureField(title, text: text)
+            .focused($focus, equals: field)
+            .submitLabel(.go)
+            .onSubmit(submit)
+            .padding(12)
+            .background(Theme.muted, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var trimmedEmail: String {
+        email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func submit() {
+        errorText = nil
+        infoText = nil
+        guard ServerSettings.isValidEmail(trimmedEmail) else {
+            errorText = "Enter a valid email address."
+            return
+        }
+        if mode == .signUp {
+            guard password.count >= Self.passwordMinimum else {
+                errorText = "Use at least \(Self.passwordMinimum) characters for your password."
+                return
+            }
+            guard password == confirm else {
+                errorText = "The two passwords don't match."
+                return
+            }
+        } else if password.isEmpty {
+            errorText = "Enter your password."
+            return
+        }
+        saveServerIfEdited()
+        focus = nil
+
+        Task {
+            do {
+                if mode == .signIn {
+                    try await auth.logIn(email: trimmedEmail, password: password)
+                    store.serverChanged()
+                } else {
+                    try await auth.signUp(email: trimmedEmail, password: password,
+                                          name: name.trimmingCharacters(in: .whitespacesAndNewlines))
+                    mode = .signIn
+                    confirm = ""
+                    awaitingVerification = true
+                    infoText = "Check \(trimmedEmail) for a link to activate your account, then sign in."
+                }
+            } catch AuthError.emailNotVerified {
+                awaitingVerification = true
+                errorText = AuthError.emailNotVerified.errorDescription
+            } catch {
+                errorText = error.localizedDescription
+            }
+        }
+    }
+
+    private func resendLink() {
+        guard ServerSettings.isValidEmail(trimmedEmail) else { return }
+        Task {
+            do {
+                try await auth.resendVerification(email: trimmedEmail)
+                errorText = nil
+                infoText = "A new link is on its way to \(trimmedEmail)."
+            } catch {
+                errorText = error.localizedDescription
+            }
+        }
+    }
+
+    private func forgotPassword() {
+        errorText = nil
+        guard ServerSettings.isValidEmail(trimmedEmail) else {
+            errorText = "Type your email above first, then tap Forgot password."
+            return
+        }
+        saveServerIfEdited()
+        Task {
+            do {
+                try await auth.forgotPassword(email: trimmedEmail)
+                infoText = "If there's an account for \(trimmedEmail), a reset link is on its way. Choose a new password there, then sign in here."
+            } catch {
+                errorText = error.localizedDescription
+            }
         }
     }
 
@@ -155,11 +323,6 @@ struct SignInView: View {
         settings.baseURLString = url.absoluteString
         serverAddress = url.absoluteString
         store.serverChanged()
-    }
-
-    private func logIn() {
-        saveServerIfEdited()
-        Task { await auth.logIn() }
     }
 
     private func developerSignIn() {

@@ -1,33 +1,33 @@
-import AuthenticationServices
 import Foundation
 import Observation
-import UIKit
 
-enum AuthError: LocalizedError {
-    case notConfigured
-    case cancelled
+enum AuthError: LocalizedError, Equatable {
+    case noServer
+    case emailNotVerified
     case badResponse(String)
     case denied(String)
 
     var errorDescription: String? {
         switch self {
-        case .notConfigured:
-            return "Auth0 isn't configured. Set Auth0Domain and Auth0ClientID in Info.plist."
-        case .cancelled:
-            return "Login was cancelled."
+        case .noServer:
+            return "Set a server address first."
+        case .emailNotVerified:
+            return "Confirm your email first. Open the link we sent you, then sign in."
         case .badResponse(let detail):
-            return "Auth0 sent something unexpected. \(detail)"
+            return "The server sent something unexpected. \(detail)"
         case .denied(let detail):
             return detail
         }
     }
 }
 
-/// Auth0 Universal Login, the same identity provider and tenant the web client
-/// uses — Authorization Code with PKCE, run in `ASWebAuthenticationSession`.
+/// RecallCards' own accounts — the same ones the website uses
+/// (flashcard-backend/accounts.py). Email and password go to `/api/auth/login`,
+/// which answers with a short-lived access token and a refresh token. Both are
+/// kept in the Keychain; the refresh token is single use and rotated on every
+/// refresh.
 ///
-/// Deliberately no third-party SDK: the flow is four requests, and this keeps
-/// the project dependency-free.
+/// New accounts are activated by an emailed link that opens the website.
 @MainActor
 @Observable
 final class AuthService {
@@ -35,20 +35,17 @@ final class AuthService {
     private(set) var isAuthenticating = false
     var errorMessage: String?
 
-    let configuration: AuthConfiguration
-
+    @ObservationIgnored private let settings: ServerSettings
     @ObservationIgnored private let keychain: KeychainStore
     @ObservationIgnored private let urlSession: URLSession
-    @ObservationIgnored private let presenter = WebAuthPresenter()
-    @ObservationIgnored private var webAuthSession: ASWebAuthenticationSession?
     @ObservationIgnored private var refreshTask: Task<String?, Never>?
 
     private static let keychainAccount = "auth.session"
 
-    init(configuration: AuthConfiguration = .fromBundle(),
+    init(settings: ServerSettings,
          keychain: KeychainStore = KeychainStore(),
          urlSession: URLSession = .shared) {
-        self.configuration = configuration
+        self.settings = settings
         self.keychain = keychain
         self.urlSession = urlSession
         session = Self.loadSession(from: keychain)
@@ -56,39 +53,39 @@ final class AuthService {
 
     var isSignedIn: Bool { session != nil }
     var email: String? { session?.email }
-    var isConfigured: Bool { configuration.isConfigured }
 
-    // MARK: - Login
+    // MARK: - Sign in / sign up
 
-    func logIn() async {
-        guard configuration.isConfigured else {
-            errorMessage = AuthError.notConfigured.errorDescription
-            return
-        }
+    /// Throws `AuthError.emailNotVerified` for an account that isn't activated yet.
+    func logIn(email: String, password: String) async throws {
         guard !isAuthenticating else { return }
-
         isAuthenticating = true
         defer { isAuthenticating = false }
 
-        do {
-            let pkce = PKCEChallenge()
-            let state = PKCEChallenge.randomURLSafeString(byteCount: 16)
-            let nonce = PKCEChallenge.randomURLSafeString(byteCount: 16)
+        let tokens: TokenResponse = try await post("login", ["email": email, "password": password])
+        store(tokens: tokens, fallbackEmail: email)
+    }
 
-            let callback = try await presentAuthorizeSession(pkce: pkce, state: state, nonce: nonce)
-            let code = try authorizationCode(from: callback, expectedState: state)
-            let tokens = try await exchange(code: code, verifier: pkce.verifier)
-            try store(tokens: tokens, expectedNonce: nonce)
-        } catch AuthError.cancelled {
-            // Backing out of the login sheet isn't an error worth alerting on.
-        } catch {
-            errorMessage = (error as? AuthError)?.errorDescription ?? error.localizedDescription
-        }
+    /// Creates the account and emails the activation link. Signing in works
+    /// once the link has been opened.
+    func signUp(email: String, password: String, name: String) async throws {
+        guard !isAuthenticating else { return }
+        isAuthenticating = true
+        defer { isAuthenticating = false }
+
+        let _: MessageResponse = try await post("signup", ["email": email, "password": password, "name": name])
+    }
+
+    func resendVerification(email: String) async throws {
+        let _: MessageResponse = try await post("resend-verification", ["email": email])
+    }
+
+    func forgotPassword(email: String) async throws {
+        let _: MessageResponse = try await post("forgot-password", ["email": email])
     }
 
     /// Local bypass mirroring the web client's dev mode. No tokens are minted,
-    /// so it only works because the backend's card endpoints key on the email
-    /// alone.
+    /// so it only works against a backend started with RECALLCARDS_DEV_AUTH.
     func logInAsDeveloper(email: String) {
         let session = AuthSession(email: email.lowercased(), name: "Developer",
                                   isDeveloperSession: true)
@@ -98,28 +95,16 @@ final class AuthService {
 
     // MARK: - Logout
 
-    /// Clears the local session, then asks Auth0 to drop its own cookie so the
-    /// next login actually prompts instead of silently reusing the SSO session.
+    /// Clears the local session and revokes the refresh token on the server.
     func logOut() async {
-        let wasFederated = session?.isDeveloperSession == false
-        session = nil
-        keychain.delete(Self.keychainAccount)
+        let refreshToken = session?.refreshToken
+        signOutLocally()
         refreshTask?.cancel()
         refreshTask = nil
 
-        guard wasFederated, configuration.isConfigured,
-              let logoutURL = configuration.logoutURL,
-              var components = URLComponents(url: logoutURL, resolvingAgainstBaseURL: false)
-        else { return }
-
-        components.queryItems = [
-            URLQueryItem(name: "client_id", value: configuration.clientID),
-            URLQueryItem(name: "returnTo", value: configuration.logoutReturnURI),
-        ]
-        guard let url = components.url else { return }
-
-        _ = try? await presentWebAuth(url: url, callbackScheme: configuration.scheme,
-                                      ephemeral: false)
+        if let refreshToken {
+            let _: MessageResponse? = try? await post("logout", ["refresh_token": refreshToken])
+        }
     }
 
     // MARK: - Tokens
@@ -131,7 +116,8 @@ final class AuthService {
         guard let token = session.accessToken else { return nil }
         guard session.needsRefresh else { return token }
 
-        // Collapse concurrent callers onto one refresh.
+        // Collapse concurrent callers onto one refresh: the refresh token is
+        // single use, so a second refresh with the same one would fail.
         if let refreshTask { return await refreshTask.value }
         let task = Task<String?, Never> { [weak self] in
             await self?.performRefresh()
@@ -144,133 +130,80 @@ final class AuthService {
 
     private func performRefresh() async -> String? {
         guard let session, let refreshToken = session.refreshToken else {
-            // Nothing to refresh with: an expired token means signed out.
             if self.session?.isExpired == true { signOutLocally() }
             return nil
         }
 
         do {
-            let tokens = try await requestTokens(body: [
-                "grant_type": "refresh_token",
-                "client_id": configuration.clientID,
-                "refresh_token": refreshToken,
-            ])
+            let tokens: TokenResponse = try await post("refresh", ["refresh_token": refreshToken])
             var updated = session
             updated.accessToken = tokens.accessToken
             updated.expiresAt = tokens.expiresAt
-            // Auth0 only returns a new refresh token when rotation is on.
             if let rotated = tokens.refreshToken { updated.refreshToken = rotated }
             self.session = updated
             persist(updated)
             return tokens.accessToken
-        } catch {
-            // A rejected refresh token is terminal — the user has to log in again.
+        } catch AuthError.denied {
+            // A refused refresh token is terminal — the user has to sign in again.
             signOutLocally()
-            errorMessage = "Your session expired. Please log in again."
+            errorMessage = "Your session expired. Please sign in again."
+            return nil
+        } catch {
+            // Offline or the server is down: keep the session and try later.
             return nil
         }
     }
 
-    // MARK: - Flow steps
+    // MARK: - HTTP
 
-    private func presentAuthorizeSession(pkce: PKCEChallenge, state: String,
-                                         nonce: String) async throws -> URL {
-        guard let authorizeURL = configuration.authorizeURL,
-              var components = URLComponents(url: authorizeURL, resolvingAgainstBaseURL: false)
-        else { throw AuthError.notConfigured }
-
-        var items = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: configuration.clientID),
-            URLQueryItem(name: "redirect_uri", value: configuration.redirectURI),
-            URLQueryItem(name: "scope", value: AuthConfiguration.scopes),
-            URLQueryItem(name: "state", value: state),
-            URLQueryItem(name: "nonce", value: nonce),
-            URLQueryItem(name: "code_challenge", value: pkce.challenge),
-            URLQueryItem(name: "code_challenge_method", value: pkce.method),
-        ]
-        if let audience = configuration.audience {
-            items.append(URLQueryItem(name: "audience", value: audience))
-        }
-        components.queryItems = items
-
-        guard let url = components.url else { throw AuthError.notConfigured }
-        return try await presentWebAuth(url: url, callbackScheme: configuration.scheme,
-                                        ephemeral: false)
+    private struct MessageResponse: Decodable {
+        var message: String?
     }
 
-    private func authorizationCode(from callback: URL, expectedState: String) throws -> String {
-        guard let components = URLComponents(url: callback, resolvingAgainstBaseURL: false),
-              let items = components.queryItems
-        else { throw AuthError.badResponse("No parameters in the callback.") }
-
-        func value(_ name: String) -> String? {
-            items.first { $0.name == name }?.value
-        }
-
-        if let error = value("error") {
-            throw AuthError.denied(value("error_description") ?? error)
-        }
-        // Guards against a callback being replayed from another login attempt.
-        guard value("state") == expectedState else {
-            throw AuthError.badResponse("State mismatch.")
-        }
-        guard let code = value("code") else {
-            throw AuthError.badResponse("No authorization code.")
-        }
-        return code
+    private struct ErrorResponse: Decodable {
+        var error: String?
+        var code: String?
     }
 
-    private func exchange(code: String, verifier: String) async throws -> TokenResponse {
-        try await requestTokens(body: [
-            "grant_type": "authorization_code",
-            "client_id": configuration.clientID,
-            "code_verifier": verifier,
-            "code": code,
-            "redirect_uri": configuration.redirectURI,
-        ])
-    }
-
-    private func requestTokens(body: [String: String]) async throws -> TokenResponse {
-        guard let tokenURL = configuration.tokenURL else { throw AuthError.notConfigured }
-
-        var request = URLRequest(url: tokenURL)
+    private func post<T: Decodable>(_ path: String, _ body: [String: String]) async throws -> T {
+        guard let base = settings.baseURL else { throw AuthError.noServer }
+        var request = URLRequest(url: base.appendingPathComponent("api/auth/\(path)"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 20
 
-        let (data, response) = try await urlSession.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.data(for: request)
+        } catch {
+            throw AuthError.badResponse("Couldn't reach \(settings.displayHost). \(error.localizedDescription)")
+        }
+
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
-                .flatMap { $0?["error_description"] as? String }
-            throw AuthError.denied(detail ?? "Auth0 returned status \(http.statusCode).")
+            let detail = try? JSONDecoder().decode(ErrorResponse.self, from: data)
+            if detail?.code == "email_not_verified" { throw AuthError.emailNotVerified }
+            if (500...599).contains(http.statusCode), detail?.error == nil {
+                throw AuthError.badResponse("Server error \(http.statusCode).")
+            }
+            throw AuthError.denied(detail?.error ?? "The server answered \(http.statusCode).")
         }
         do {
-            return try JSONDecoder().decode(TokenResponse.self, from: data)
+            return try JSONDecoder().decode(T.self, from: data)
         } catch {
             throw AuthError.badResponse(error.localizedDescription)
         }
     }
 
-    private func store(tokens: TokenResponse, expectedNonce: String) throws {
-        guard let idToken = tokens.idToken, let claims = IDTokenClaims(jwt: idToken) else {
-            throw AuthError.badResponse("No ID token, so there's no email to identify you by.")
-        }
-        guard claims.nonce == expectedNonce else {
-            throw AuthError.badResponse("Nonce mismatch.")
-        }
-        guard claims.iss == configuration.issuer else {
-            throw AuthError.badResponse("Unexpected token issuer.")
-        }
-        guard let email = claims.email?.lowercased(), !email.isEmpty else {
-            throw AuthError.badResponse("Your Auth0 profile has no email address, which the card API needs.")
-        }
+    // MARK: - Persistence
 
+    private func store(tokens: TokenResponse, fallbackEmail: String) {
         let session = AuthSession(
-            email: email,
-            name: claims.name ?? claims.nickname,
-            pictureURL: claims.pictureURL,
-            subject: claims.sub,
+            email: (tokens.user?.email ?? fallbackEmail).lowercased(),
+            name: tokens.user?.name,
+            subject: tokens.user?.email,
             accessToken: tokens.accessToken,
             refreshToken: tokens.refreshToken,
             expiresAt: tokens.expiresAt
@@ -278,40 +211,6 @@ final class AuthService {
         self.session = session
         persist(session)
     }
-
-    // MARK: - Web session
-
-    private func presentWebAuth(url: URL, callbackScheme: String,
-                                ephemeral: Bool) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(url: url,
-                                                     callbackURLScheme: callbackScheme) { callback, error in
-                if let error {
-                    let code = (error as NSError).code
-                    if code == ASWebAuthenticationSessionError.canceledLogin.rawValue {
-                        continuation.resume(throwing: AuthError.cancelled)
-                    } else {
-                        continuation.resume(throwing: AuthError.denied(error.localizedDescription))
-                    }
-                    return
-                }
-                guard let callback else {
-                    continuation.resume(throwing: AuthError.badResponse("Empty callback."))
-                    return
-                }
-                continuation.resume(returning: callback)
-            }
-            session.presentationContextProvider = presenter
-            session.prefersEphemeralWebBrowserSession = ephemeral
-            webAuthSession = session
-
-            if !session.start() {
-                continuation.resume(throwing: AuthError.badResponse("Couldn't open the login page."))
-            }
-        }
-    }
-
-    // MARK: - Persistence
 
     private func persist(_ session: AuthSession) {
         guard let data = try? JSONEncoder().encode(session) else { return }
@@ -327,6 +226,12 @@ final class AuthService {
         guard let data = keychain.load(keychainAccount),
               let session = try? JSONDecoder().decode(AuthSession.self, from: data)
         else { return nil }
+        // A session from the Auth0 era has an access token the API no longer
+        // accepts and a refresh token it never issued: start over.
+        if !session.isDeveloperSession, session.subject?.contains("|") == true {
+            keychain.delete(keychainAccount)
+            return nil
+        }
         // An expired access token is fine on launch as long as it can be
         // refreshed; without a refresh token the session is dead.
         if session.isExpired && session.refreshToken == nil && !session.isDeveloperSession {
@@ -334,15 +239,5 @@ final class AuthService {
             return nil
         }
         return session
-    }
-}
-
-/// Tells `ASWebAuthenticationSession` which window to present over.
-final class WebAuthPresenter: NSObject, ASWebAuthenticationPresentationContextProviding {
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap(\.windows)
-            .first { $0.isKeyWindow } ?? ASPresentationAnchor()
     }
 }

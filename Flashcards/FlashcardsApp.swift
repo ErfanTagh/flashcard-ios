@@ -8,7 +8,7 @@ struct FlashcardsApp: App {
 
     init() {
         let settings = ServerSettings()
-        let auth = AuthService()
+        let auth = AuthService(settings: settings)
         _settings = State(initialValue: settings)
         _auth = State(initialValue: auth)
         _store = State(initialValue: LibraryStore(settings: settings, auth: auth))

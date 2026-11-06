@@ -3,7 +3,7 @@ import Observation
 
 /// Where the app looks for the backend.
 ///
-/// The web client relies on a Vite dev proxy and Auth0; on a phone there is no
+/// The web client relies on a Vite dev proxy; on a phone there is no
 /// proxy, so the host is a setting. It defaults to the port the local override
 /// in `docker-compose.local.yml` publishes.
 ///

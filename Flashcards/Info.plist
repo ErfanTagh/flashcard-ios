@@ -37,27 +37,6 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<key>Auth0Domain</key>
-	<string>dev-43bumhcy.us.auth0.com</string>
-	<key>Auth0ClientID</key>
-	<string>k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u</string>
-	<key>Auth0Audience</key>
-	<string>recallcards</string>
-	<key>Auth0Scheme</key>
-	<string>com.recallcards.flashcards</string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeRole</key>
-			<string>Editor</string>
-			<key>CFBundleURLName</key>
-			<string>auth0</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>com.recallcards.flashcards</string>
-			</array>
-		</dict>
-	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
